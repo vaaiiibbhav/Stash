@@ -1,0 +1,42 @@
+# Environment files — never commit secrets. Only the template is tracked.
+.env
+.env.*
+!.env.example
+
+# Rust / Tauri build artifacts
+src-tauri/target/
+
+# .NET / Fable build artifacts
+src/bin/
+src/obj/
+fable_modules/
+*.fs.js
+.fable/
+
+# Logs
+logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+node_modules
+dist
+dist-ssr
+*.local
+
+# Local agent/tooling state
+.claude/
+
+# Editor directories and files
+.vscode/*
+!.vscode/extensions.json
+.idea
+.DS_Store
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
