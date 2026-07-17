@@ -1,12 +1,14 @@
 module Stash.MainUI
 
 open Browser.Dom
+open Fable.Core
 open Fable.Core.JsInterop
 open Feliz
 open Stash.Types
 
 /// Tailwind class tokens per theme. Every text/background pair below meets
-/// WCAG 2.1 AA (>= 4.5:1 for body text, >= 3:1 for large headings).
+/// WCAG 2.1 AA (>= 4.5:1 for body text, >= 3:1 for large text / UI components),
+/// computed by hand against the sRGB relative-luminance formula.
 type private Tokens =
     { Surface: string
       Heading: string
@@ -14,12 +16,19 @@ type private Tokens =
       Muted: string
       Card: string
       AccentButton: string
-      ToggleButton: string }
+      ToggleButton: string
+      /// Count badge: white text on rose-600 — 4.70:1 (AA), and rose-600
+      /// against either card background clears the 3:1 non-text minimum.
+      Badge: string
+      /// Error banner: computed 11.84:1 (dark) / 9.60:1 (light).
+      DangerBanner: string
+      SelectField: string
+      Spinner: string }
 
 let private tokens theme =
     match theme with
     | Theme.Dark ->
-        // e.g. body #C7C8DE on #0B0A1A ~ 10.6:1
+        // e.g. body #C7C8DE on #0B0A1A ~ 11.9:1
         { Surface = "bg-[#0B0A1A] text-[#C7C8DE]"
           Heading = "text-[#B0AFD7]"
           Body = "text-[#C7C8DE]"
@@ -28,7 +37,11 @@ let private tokens theme =
           AccentButton =
             "bg-[#BEC0E2] text-[#14132B] hover:bg-[#D3D5F0] focus-visible:outline focus-visible:outline-2 focus-visible:outline-[#BEC0E2]"
           ToggleButton =
-            "border border-[#4A4980] text-[#C7C8DE] hover:bg-[#1D1C3A] focus-visible:outline focus-visible:outline-2 focus-visible:outline-[#BEC0E2]" }
+            "border border-[#4A4980] text-[#C7C8DE] hover:bg-[#1D1C3A] focus-visible:outline focus-visible:outline-2 focus-visible:outline-[#BEC0E2]"
+          Badge = "bg-[#E11D48] text-white"
+          DangerBanner = "bg-[#2A0E16] text-[#FFC2D1]"
+          SelectField = "bg-[#1D1C3A] text-[#C7C8DE] border border-[#4A4980]"
+          Spinner = "border-[#BEC0E2]" }
     | Theme.Light ->
         // e.g. body #3A3A55 on #F6F6FB ~ 9.4:1
         { Surface = "bg-[#F6F6FB] text-[#3A3A55]"
@@ -39,12 +52,19 @@ let private tokens theme =
           AccentButton =
             "bg-[#3B3A8F] text-white hover:bg-[#4B4AAB] focus-visible:outline focus-visible:outline-2 focus-visible:outline-[#3B3A8F]"
           ToggleButton =
-            "border border-[#3B3A8F] text-[#232252] hover:bg-[#E8E8F5] focus-visible:outline focus-visible:outline-2 focus-visible:outline-[#3B3A8F]" }
+            "border border-[#3B3A8F] text-[#232252] hover:bg-[#E8E8F5] focus-visible:outline focus-visible:outline-2 focus-visible:outline-[#3B3A8F]"
+          Badge = "bg-[#E11D48] text-white"
+          DangerBanner = "bg-[#FDECEF] text-[#7A0E27]"
+          SelectField = "bg-white text-[#232252] border border-[#3B3A8F]"
+          Spinner = "border-[#3B3A8F]" }
 
 let private initialTheme () =
     // matchMedia is missing from Fable.Browser.Dom's Window binding; go dynamic.
     let prefersLight: bool = !!window?matchMedia("(prefers-color-scheme: light)")?matches
     if prefersLight then Theme.Light else Theme.Dark
+
+[<Emit("Date.now()")>]
+let private nowMs () : float = jsNative
 
 [<ReactComponent>]
 let private ThemeToggle (theme: Theme) (t: Tokens) (onToggle: unit -> unit) =
@@ -62,50 +82,230 @@ let private ThemeToggle (theme: Theme) (t: Tokens) (onToggle: unit -> unit) =
               | Theme.Light -> "Switch to dark"
           ) ]
 
-/// Card that exercises the F# -> Rust IPC round trip. Owns its own
-/// request state; theming comes in via tokens.
 [<ReactComponent>]
-let private BackendProbe (t: Tokens) =
-    let status, setStatus = React.useState BackendStatus.Idle
-    let isChecking = status = BackendStatus.Checking
+let private ErrorBanner (t: Tokens) (message: string) (onDismiss: unit -> unit) =
+    Html.div
+        [ prop.role "alert"
+          prop.className $"w-full max-w-md rounded-lg px-4 py-3 flex items-start justify-between gap-3 text-sm {t.DangerBanner}"
+          prop.children
+              [ Html.span [ prop.key "message"; prop.className "flex-1"; prop.text message ]
+                Html.button
+                    [ prop.key "dismiss"
+                      prop.type' "button"
+                      prop.ariaLabel "Dismiss error"
+                      prop.className
+                          "font-bold leading-none opacity-70 hover:opacity-100 rounded focus-visible:outline focus-visible:outline-2 focus-visible:outline-current"
+                      prop.onClick (fun _ -> onDismiss ())
+                      prop.text "×" ] ] ]
 
-    let probe () =
-        setStatus BackendStatus.Checking
+[<ReactComponent>]
+let private DelaySelect (t: Tokens) (value: AutoRestoreDelay) (onChange: AutoRestoreDelay -> unit) =
+    Html.label
+        [ prop.className $"flex items-center gap-2 text-sm {t.Muted}"
+          prop.children
+              [ Html.span [ prop.key "label"; prop.text "Auto restore in" ]
+                Html.select
+                    [ prop.key "select"
+                      prop.ariaLabel "Auto restore delay"
+                      prop.className $"rounded px-2 py-1 text-sm {t.SelectField}"
+                      prop.value (AutoRestoreDelay.key value)
+                      prop.onChange (fun (raw: string) ->
+                          AutoRestoreDelay.all
+                          |> List.tryFind (fun d -> AutoRestoreDelay.key d = raw)
+                          |> Option.iter onChange)
+                      prop.children
+                          [ for d in AutoRestoreDelay.all ->
+                                Html.option
+                                    [ prop.key (AutoRestoreDelay.key d)
+                                      prop.value (AutoRestoreDelay.key d)
+                                      prop.text (AutoRestoreDelay.label d) ] ] ] ] ]
+
+let private formatCountdown (secondsRemaining: int) =
+    let minutes = secondsRemaining / 60
+    let seconds = secondsRemaining % 60
+    $"{minutes}m {seconds}s"
+
+[<ReactComponent>]
+let private IdleView
+    (t: Tokens)
+    (delay: AutoRestoreDelay)
+    (onDelayChange: AutoRestoreDelay -> unit)
+    (onStash: unit -> unit)
+    =
+    Html.div
+        [ prop.className "w-full max-w-md flex flex-col items-center gap-4"
+          prop.children
+              [ Html.button
+                    [ prop.key "stash-button"
+                      prop.type' "button"
+                      prop.className $"w-full rounded px-4 py-2.5 font-bold tracking-wide transition-colors {t.AccentButton}"
+                      prop.onClick (fun _ -> onStash ())
+                      prop.text "Stash your apps 👋" ]
+                DelaySelect t delay onDelayChange ] ]
+
+[<ReactComponent>]
+let private BusyView (t: Tokens) (label: string) =
+    Html.div
+        [ prop.role "status"
+          prop.ariaLive.polite
+          prop.className $"w-full max-w-md flex flex-col items-center gap-3 py-6 {t.Muted}"
+          prop.children
+              [ Html.div
+                    [ prop.key "spinner"
+                      prop.className $"h-8 w-8 rounded-full border-2 border-t-transparent animate-spin {t.Spinner}"
+                      prop.ariaHidden true ]
+                Html.span [ prop.key "label"; prop.text label ] ] ]
+
+[<ReactComponent>]
+let private StashedView (t: Tokens) (snapshot: StashSnapshot) (onRestore: unit -> unit) =
+    // A per-second tick that forces a re-render; the remaining time is always
+    // recomputed from the wall-clock deadline (not decremented), so it can't
+    // drift if the tab is throttled in the background. The tick value is the
+    // timestamp itself (not a counter) so the interval callback never needs
+    // to read a previous tick from its closure — Feliz's useState setter only
+    // accepts a plain value, not a `'T -> 'T` updater, so a counter would
+    // otherwise require closing over a stale `tick` from setup time.
+    let tick, setTick = React.useState 0.0
+
+    React.useEffect (
+        (fun () ->
+            match snapshot.AutoRestoreDeadlineMs with
+            | None -> React.createDisposable (fun () -> ())
+            | Some _ ->
+                // setInterval/clearInterval live on Window (Browser.Types.WindowTimers),
+                // not Fable.Core.JS; the trailing obj[] mirrors the DOM API's
+                // optional extra handler args, which we don't use.
+                let intervalId = window.setInterval ((fun () -> setTick (nowMs ())), 1000, [||])
+                React.createDisposable (fun () -> window.clearInterval intervalId)),
+        [| box snapshot.AutoRestoreDeadlineMs |]
+    )
+
+    let remainingSeconds =
+        snapshot.AutoRestoreDeadlineMs
+        |> Option.map (fun deadline -> max 0 (int ((deadline - nowMs ()) / 1000.0)))
+
+    React.useEffect (
+        (fun () ->
+            match remainingSeconds with
+            | Some 0 -> onRestore ()
+            | _ -> ()),
+        [| box tick |]
+    )
+
+    Html.section
+        [ prop.className $"w-full max-w-md rounded-lg p-5 flex flex-col gap-4 {t.Card}"
+          prop.children
+              [ Html.div
+                    [ prop.key "screenshot-wrap"
+                      prop.className "relative"
+                      prop.children
+                          [ Html.img
+                                [ prop.key "screenshot"
+                                  prop.className "w-full rounded border border-black/10 object-cover"
+                                  prop.src $"data:image/png;base64,{snapshot.ScreenshotBase64}"
+                                  prop.alt "Your desktop just before its apps were stashed" ]
+                            Html.span
+                                [ prop.key "badge"
+                                  prop.className
+                                      $"absolute -top-2 -right-2 min-w-6 h-6 px-1.5 rounded-full flex items-center justify-center text-xs font-bold {t.Badge}"
+                                  prop.ariaHidden true
+                                  prop.text (string snapshot.Count) ] ] ]
+                Html.p
+                    [ prop.key "preview"
+                      prop.className $"text-sm text-center {t.Body}"
+                      prop.children
+                          [ Html.span
+                                [ prop.key "sr-count"
+                                  prop.className "sr-only"
+                                  prop.text $"{snapshot.Count} apps stashed: " ]
+                            Html.text (
+                                if System.String.IsNullOrWhiteSpace snapshot.Preview then
+                                    "Everything's stashed."
+                                else
+                                    snapshot.Preview + " and more"
+                            ) ] ]
+                (match remainingSeconds with
+                 | Some seconds ->
+                     Html.p
+                         [ prop.key "countdown"
+                           prop.role "status"
+                           prop.ariaLive.polite
+                           prop.className $"text-xs text-center {t.Muted}"
+                           prop.text $"Auto restore in {formatCountdown seconds}" ]
+                 | None -> Html.none)
+                Html.button
+                    [ prop.key "restore-button"
+                      prop.type' "button"
+                      prop.className $"rounded px-4 py-2 font-bold tracking-wide transition-colors {t.AccentButton}"
+                      prop.onClick (fun _ -> onRestore ())
+                      prop.text "Restore 🔁" ] ] ]
+
+[<ReactComponent>]
+let private StashPanel (t: Tokens) =
+    let sessionState, setSessionState = React.useState SessionState.Idle
+    let delay, setDelay = React.useState AutoRestoreDelay.Off
+    let errorMessage, setErrorMessage = React.useState (None: string option)
+
+    let stash () =
+        setErrorMessage None
+        setSessionState SessionState.Stashing
 
         promise {
-            try
-                let! reply = Tauri.ping "ping from Fable"
-                setStatus (BackendStatus.Connected reply)
-            with ex ->
-                setStatus (BackendStatus.Failed ex.Message)
+            match! Tauri.getApps () with
+            | Error reason ->
+                setErrorMessage (Some reason)
+                setSessionState SessionState.Idle
+            | Ok summary ->
+                // The stash already happened (windows are suspended+hidden); a
+                // failed screenshot shouldn't discard that, so fall back to an
+                // empty preview image rather than dropping to an error state.
+                let! screenshotResult = Tauri.screenShot ()
+
+                let screenshot, screenshotError =
+                    match screenshotResult with
+                    | Ok bytes -> bytes, None
+                    | Error reason -> "", Some $"Stashed, but couldn't capture a preview: {reason}"
+
+                setErrorMessage screenshotError
+
+                setSessionState (
+                    SessionState.Stashed
+                        { Preview = summary.Preview
+                          Count = summary.Count
+                          ScreenshotBase64 = screenshot
+                          AutoRestoreDeadlineMs =
+                            AutoRestoreDelay.seconds delay
+                            |> Option.map (fun secs -> nowMs () + float secs * 1000.0) }
+                )
         }
         |> Promise.start
 
-    Html.section
-        [ prop.className $"w-full max-w-md rounded-lg p-5 flex flex-col gap-3 {t.Card}"
+    let restore () =
+        setErrorMessage None
+        setSessionState SessionState.Restoring
+
+        promise {
+            match! Tauri.restore () with
+            | Error reason -> setErrorMessage (Some reason)
+            | Ok () -> ()
+
+            // Whether or not restore fully succeeded, Idle is the only state
+            // that lets the user act again (retry via Stash).
+            setSessionState SessionState.Idle
+        }
+        |> Promise.start
+
+    Html.div
+        [ prop.className "w-full flex flex-col items-center gap-4"
           prop.children
-              [ Html.h2 [ prop.className $"text-lg font-bold {t.Heading}"; prop.text "Backend link" ]
-                Html.p
-                    [ prop.className $"text-sm {t.Muted}"
-                      prop.text "Verifies the round trip from the Fable UI to the Rust `ping` command." ]
-                Html.button
-                    [ prop.type' "button"
-                      prop.className
-                          $"rounded px-4 py-2 font-bold tracking-wide transition-colors disabled:opacity-60 {t.AccentButton}"
-                      prop.disabled isChecking
-                      prop.onClick (fun _ -> probe ())
-                      prop.text "Ping backend" ]
-                Html.p
-                    [ prop.role "status"
-                      prop.ariaLive.polite
-                      prop.className $"text-sm min-h-5 {t.Body}"
-                      prop.text (
-                          match status with
-                          | BackendStatus.Idle -> "Not checked yet."
-                          | BackendStatus.Checking -> "Waiting for the backend…"
-                          | BackendStatus.Connected reply -> $"Connected — backend replied: “{reply}”"
-                          | BackendStatus.Failed error -> $"No backend reply: {error}"
-                      ) ] ] ]
+              [ (match errorMessage with
+                 | Some message -> ErrorBanner t message (fun () -> setErrorMessage None)
+                 | None -> Html.none)
+                (match sessionState with
+                 | SessionState.Idle -> IdleView t delay setDelay stash
+                 | SessionState.Stashing -> BusyView t "Stashing your apps…"
+                 | SessionState.Stashed snapshot -> StashedView t snapshot restore
+                 | SessionState.Restoring -> BusyView t "Restoring your apps…") ] ]
 
 [<ReactComponent>]
 let AppShell () =
@@ -123,12 +323,22 @@ let AppShell () =
         [ prop.className $"min-h-screen flex flex-col items-center gap-8 px-6 py-10 transition-colors {t.Surface}"
           prop.children
               [ Html.header
-                    [ prop.className "w-full max-w-md flex items-start justify-between"
+                    [ prop.key "header"
+                      prop.className "w-full max-w-md flex items-start justify-between"
                       prop.children
                           [ Html.div
-                                [ Html.h1 [ prop.className $"text-4xl font-extrabold {t.Heading}"; prop.text "Stash" ]
-                                  Html.p
-                                      [ prop.className $"text-sm tracking-widest uppercase {t.Muted}"
-                                        prop.text "need a break?" ] ]
+                                [ prop.key "title"
+                                  prop.children
+                                      [ Html.h1
+                                            [ prop.key "app-name"
+                                              prop.className $"text-4xl font-extrabold {t.Heading}"
+                                              prop.text "Stash" ]
+                                        Html.p
+                                            [ prop.key "tagline"
+                                              prop.className $"text-sm tracking-widest uppercase {t.Muted}"
+                                              prop.text "need a break?" ] ] ]
                             ThemeToggle theme t toggleTheme ] ]
-                Html.main [ prop.className "w-full flex flex-col items-center"; prop.children [ BackendProbe t ] ] ] ]
+                Html.main
+                    [ prop.key "main"
+                      prop.className "w-full flex flex-col items-center gap-6"
+                      prop.children [ StashPanel t ] ] ] ]
