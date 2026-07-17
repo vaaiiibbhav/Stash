@@ -125,6 +125,21 @@ let private formatCountdown (secondsRemaining: int) =
     let seconds = secondsRemaining % 60
     $"{minutes}m {seconds}s"
 
+/// A coarser, minute-granular phrasing for the screen-reader announcement.
+/// Rendering this (instead of the second-by-second `formatCountdown`) inside
+/// an aria-live region matters because React only touches the DOM — and so
+/// only triggers a live-region announcement — when the rendered text
+/// actually changes. Announcing every second for up to an hour would bury
+/// assistive-tech users in a stream of updates; this text stays identical
+/// for 59 out of every 60 renders, so it only announces on the minute.
+let private formatAnnouncement (secondsRemaining: int) =
+    let minutes = secondsRemaining / 60
+    if minutes <= 0 then
+        "Auto restore in under a minute"
+    else
+        let unit = if minutes = 1 then "minute" else "minutes"
+        $"Auto restore in about {minutes} {unit}"
+
 [<ReactComponent>]
 let private IdleView
     (t: Tokens)
@@ -199,11 +214,20 @@ let private StashedView (t: Tokens) (snapshot: StashSnapshot) (onRestore: unit -
                     [ prop.key "screenshot-wrap"
                       prop.className "relative"
                       prop.children
-                          [ Html.img
-                                [ prop.key "screenshot"
-                                  prop.className "w-full rounded border border-black/10 object-cover"
-                                  prop.src $"data:image/png;base64,{snapshot.ScreenshotBase64}"
-                                  prop.alt "Your desktop just before its apps were stashed" ]
+                          [ (if System.String.IsNullOrEmpty snapshot.ScreenshotBase64 then
+                                 // Screenshot capture failed (see the error banner); an
+                                 // empty src would render the browser's broken-image icon.
+                                 Html.div
+                                     [ prop.key "screenshot"
+                                       prop.className
+                                           $"w-full aspect-video rounded border border-black/10 flex items-center justify-center text-xs {t.Muted}"
+                                       prop.text "No preview available" ]
+                             else
+                                 Html.img
+                                     [ prop.key "screenshot"
+                                       prop.className "w-full rounded border border-black/10 object-cover"
+                                       prop.src $"data:image/png;base64,{snapshot.ScreenshotBase64}"
+                                       prop.alt "Your desktop just before its apps were stashed" ])
                             Html.span
                                 [ prop.key "badge"
                                   prop.className
@@ -213,25 +237,36 @@ let private StashedView (t: Tokens) (snapshot: StashSnapshot) (onRestore: unit -
                 Html.p
                     [ prop.key "preview"
                       prop.className $"text-sm text-center {t.Body}"
-                      prop.children
-                          [ Html.span
-                                [ prop.key "sr-count"
-                                  prop.className "sr-only"
-                                  prop.text $"{snapshot.Count} apps stashed: " ]
-                            Html.text (
-                                if System.String.IsNullOrWhiteSpace snapshot.Preview then
-                                    "Everything's stashed."
-                                else
-                                    snapshot.Preview + " and more"
-                            ) ] ]
+                      // One sentence, correct for sighted and screen-reader users alike:
+                      // the count is stated in words, and "and more" only appears when
+                      // Preview was actually truncated. main.rs's get_apps caps the
+                      // preview at the first 3 titles it suspends, so Count > 3 is
+                      // exactly the condition under which titles were left out.
+                      prop.text (
+                          if snapshot.Count = 0 then
+                              "Nothing to stash — your desktop was already clear."
+                          elif snapshot.Count > 3 then
+                              $"{snapshot.Count} apps stashed: {snapshot.Preview} and more"
+                          else
+                              $"{snapshot.Count} apps stashed: {snapshot.Preview}"
+                      ) ]
                 (match remainingSeconds with
                  | Some seconds ->
-                     Html.p
+                     Html.div
                          [ prop.key "countdown"
-                           prop.role "status"
-                           prop.ariaLive.polite
-                           prop.className $"text-xs text-center {t.Muted}"
-                           prop.text $"Auto restore in {formatCountdown seconds}" ]
+                           prop.className "text-center"
+                           prop.children
+                               [ Html.p
+                                     [ prop.key "visual"
+                                       prop.ariaHidden true
+                                       prop.className $"text-xs {t.Muted}"
+                                       prop.text $"Auto restore in {formatCountdown seconds}" ]
+                                 Html.p
+                                     [ prop.key "announcement"
+                                       prop.role "status"
+                                       prop.ariaLive.polite
+                                       prop.className "sr-only"
+                                       prop.text (formatAnnouncement seconds) ] ] ]
                  | None -> Html.none)
                 Html.button
                     [ prop.key "restore-button"
