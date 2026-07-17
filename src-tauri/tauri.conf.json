@@ -21,11 +21,7 @@
       "all": false,
       "shell": {
         "all": false,
-        "open": true,
-        "sidecar": true,
-        "scope": [
-          { "name": "bin/pssuspend", "sidecar": true }
-        ]
+        "open": true
       },
       "window": {
             "all": false,
@@ -50,10 +46,7 @@
         "icons/icon.ico"
       ],
       "identifier": "com.stash.app",
-      "targets": "all",
-      "externalBin": [
-        "bin/pssuspend"
-      ]
+      "targets": "all"
     },
     "security": {
       "csp": null

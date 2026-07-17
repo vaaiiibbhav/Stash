@@ -15,7 +15,7 @@ If you are contributing to the frontend, You'll be able to work on that regardle
 
 * The `src-tauri` folder contains the files for the rust backend. The `src` folder in side `src-tauri` contains the `main.rs` housing the backend functions.
 
-* The `bin` folder in `src-tauri` contains `pssuspend` which will be loaded as a sidecar in the application.
+* Process suspension is done natively from Rust via `NtSuspendProcess`/`NtResumeProcess` (the `windows` crate) — there is no external sidecar binary to manage.
 
 ## Requirements
 
@@ -35,15 +35,6 @@ To get started with contributing, please follow these steps:
 Tauri docs for further reference are available at [Tauri.app](https://tauri.app/v1/guides/).
 
 ## Common errors
-
-If you get an error saying `path matching bin/pssuspend-x86_64-pc-windows-gnu.exe not found.` or similar.
-
-Tauri expects a binary compatible with the target you are building to, The name format being `{binary-name}-{architecture}`.
-
-Find your architecture with this command ```rustc -Vv | Select-String "host:" | ForEach-Object {$_.Line.split(" ")[1]}```
-and rename `/bin/pssuspend` to the format.
-
----
 
 Defer also works a little slower in dev mode due to the ScreenShot function running slower, The optimisations by rust and Tauri are further applied during compiling to production. Hence, just be a little patient.
 
