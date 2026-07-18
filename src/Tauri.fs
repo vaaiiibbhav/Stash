@@ -46,3 +46,27 @@ let restore () : JS.Promise<Result<unit, string>> =
 /// (no `data:` URI prefix — callers own how it's rendered).
 let screenShot () : JS.Promise<Result<string, string>> =
     attempt (fun () -> invoke<string> "screen_shot")
+
+/// Checks for a stash left on disk by a previous run that didn't exit
+/// cleanly (crash, force-kill, logoff). Rust reports this as a
+/// `(found, preview, count)` tuple rather than an option-shaped object —
+/// the `Some`/`None` is reconstructed here, in plain F#, rather than trusted
+/// across the raw `invoke` boundary, so a malformed or absent JS `null`
+/// never gets misread as a value.
+let checkOrphanedStash () : JS.Promise<Result<StashSummary option, string>> =
+    promise {
+        let! result = attempt (fun () -> invoke<bool * string * int> "check_orphaned_stash")
+
+        return
+            result
+            |> Result.map (fun (found, preview, count) ->
+                if found then
+                    Some { Preview = preview; Count = count }
+                else
+                    None)
+    }
+
+/// Resumes and re-shows every process from a leftover stash record found by
+/// `checkOrphanedStash`, then clears that record.
+let resumeOrphaned () : JS.Promise<Result<unit, string>> =
+    attempt (fun () -> invoke<unit> "resume_orphaned")

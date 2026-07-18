@@ -7,8 +7,8 @@
 src-tauri/target/
 
 # .NET / Fable build artifacts
-src/bin/
-src/obj/
+bin/
+obj/
 fable_modules/
 *.fs.js
 .fable/

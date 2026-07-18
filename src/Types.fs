@@ -66,3 +66,30 @@ type SessionState =
     | Stashing
     | Stashed of StashSnapshot
     | Restoring
+
+/// Pure formatting for the auto-restore countdown. Kept free of any
+/// React/Feliz dependency (unlike the rest of the UI layer) so it can be unit
+/// tested directly from a plain .NET test project.
+module Countdown =
+    /// Precise mm:ss for sighted users. Never called with a negative value —
+    /// callers clamp `secondsRemaining` to >= 0 first.
+    let formatVisual (secondsRemaining: int) =
+        let minutes = secondsRemaining / 60
+        let seconds = secondsRemaining % 60
+        $"{minutes}m {seconds}s"
+
+    /// A coarser, minute-granular phrasing for the screen-reader
+    /// announcement. Rendering this — instead of the second-by-second
+    /// `formatVisual` — inside an aria-live region matters because React only
+    /// touches the DOM, and so only triggers a live-region announcement, when
+    /// the rendered text actually changes. Announcing every second for up to
+    /// an hour would bury assistive-tech users in a stream of updates; this
+    /// text stays identical for 59 out of every 60 renders, so it only
+    /// announces on the minute.
+    let formatAnnouncement (secondsRemaining: int) =
+        let minutes = secondsRemaining / 60
+        if minutes <= 0 then
+            "Auto restore in under a minute"
+        else
+            let unit = if minutes = 1 then "minute" else "minutes"
+            $"Auto restore in about {minutes} {unit}"

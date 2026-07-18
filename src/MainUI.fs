@@ -98,6 +98,42 @@ let private ErrorBanner (t: Tokens) (message: string) (onDismiss: unit -> unit) 
                       prop.onClick (fun _ -> onDismiss ())
                       prop.text "×" ] ] ]
 
+/// Shown when `checkOrphanedStash` finds a stash record left behind by a
+/// previous run that didn't exit cleanly (crash, force-kill, logoff — the
+/// normal Quit and Restore paths both clear this record). Non-interrupting
+/// (role="status", not "alert"): the affected apps are already suspended and
+/// safe, so this is informational, not urgent.
+[<ReactComponent>]
+let private OrphanBanner (t: Tokens) (summary: StashSummary) (onResume: unit -> unit) (onDismiss: unit -> unit) =
+    let description =
+        let apps = if summary.Count = 1 then "1 app" else $"{summary.Count} apps"
+        $"Stash didn't close cleanly last time — {apps} may still be stashed: {summary.Preview}."
+
+    Html.div
+        [ prop.role "status"
+          prop.ariaLive.polite
+          prop.className $"w-full max-w-md rounded-lg p-4 flex flex-col gap-3 text-sm {t.Card} {t.Body}"
+          prop.children
+              [ Html.p [ prop.key "message"; prop.text description ]
+                Html.div
+                    [ prop.key "actions"
+                      prop.className "flex gap-2 justify-end"
+                      prop.children
+                          [ Html.button
+                                [ prop.key "dismiss"
+                                  prop.type' "button"
+                                  prop.className
+                                      $"rounded px-3 py-1.5 text-sm font-semibold transition-colors {t.ToggleButton}"
+                                  prop.onClick (fun _ -> onDismiss ())
+                                  prop.text "Dismiss" ]
+                            Html.button
+                                [ prop.key "resume"
+                                  prop.type' "button"
+                                  prop.className
+                                      $"rounded px-3 py-1.5 text-sm font-bold transition-colors {t.AccentButton}"
+                                  prop.onClick (fun _ -> onResume ())
+                                  prop.text "Resume now" ] ] ] ] ]
+
 [<ReactComponent>]
 let private DelaySelect (t: Tokens) (value: AutoRestoreDelay) (onChange: AutoRestoreDelay -> unit) =
     Html.label
@@ -119,26 +155,6 @@ let private DelaySelect (t: Tokens) (value: AutoRestoreDelay) (onChange: AutoRes
                                     [ prop.key (AutoRestoreDelay.key d)
                                       prop.value (AutoRestoreDelay.key d)
                                       prop.text (AutoRestoreDelay.label d) ] ] ] ] ]
-
-let private formatCountdown (secondsRemaining: int) =
-    let minutes = secondsRemaining / 60
-    let seconds = secondsRemaining % 60
-    $"{minutes}m {seconds}s"
-
-/// A coarser, minute-granular phrasing for the screen-reader announcement.
-/// Rendering this (instead of the second-by-second `formatCountdown`) inside
-/// an aria-live region matters because React only touches the DOM — and so
-/// only triggers a live-region announcement — when the rendered text
-/// actually changes. Announcing every second for up to an hour would bury
-/// assistive-tech users in a stream of updates; this text stays identical
-/// for 59 out of every 60 renders, so it only announces on the minute.
-let private formatAnnouncement (secondsRemaining: int) =
-    let minutes = secondsRemaining / 60
-    if minutes <= 0 then
-        "Auto restore in under a minute"
-    else
-        let unit = if minutes = 1 then "minute" else "minutes"
-        $"Auto restore in about {minutes} {unit}"
 
 [<ReactComponent>]
 let private IdleView
@@ -260,13 +276,13 @@ let private StashedView (t: Tokens) (snapshot: StashSnapshot) (onRestore: unit -
                                      [ prop.key "visual"
                                        prop.ariaHidden true
                                        prop.className $"text-xs {t.Muted}"
-                                       prop.text $"Auto restore in {formatCountdown seconds}" ]
+                                       prop.text $"Auto restore in {Countdown.formatVisual seconds}" ]
                                  Html.p
                                      [ prop.key "announcement"
                                        prop.role "status"
                                        prop.ariaLive.polite
                                        prop.className "sr-only"
-                                       prop.text (formatAnnouncement seconds) ] ] ]
+                                       prop.text (Countdown.formatAnnouncement seconds) ] ] ]
                  | None -> Html.none)
                 Html.button
                     [ prop.key "restore-button"
@@ -280,6 +296,19 @@ let private StashPanel (t: Tokens) =
     let sessionState, setSessionState = React.useState SessionState.Idle
     let delay, setDelay = React.useState AutoRestoreDelay.Off
     let errorMessage, setErrorMessage = React.useState (None: string option)
+    let orphan, setOrphan = React.useState (None: StashSummary option)
+
+    // Runs once per app launch: ask Rust whether a previous run left a stash
+    // record behind without a matching restore (crash, force-kill, logoff).
+    // Best-effort — a failed check just means no recovery banner, which is
+    // safe to skip rather than surface as an error on startup.
+    React.useEffectOnce (fun () ->
+        promise {
+            match! Tauri.checkOrphanedStash () with
+            | Ok found -> setOrphan found
+            | Error _ -> ()
+        }
+        |> Promise.start)
 
     let stash () =
         setErrorMessage None
@@ -330,10 +359,25 @@ let private StashPanel (t: Tokens) =
         }
         |> Promise.start
 
+    let resumeOrphan () =
+        promise {
+            match! Tauri.resumeOrphaned () with
+            | Error reason -> setErrorMessage (Some reason)
+            | Ok () -> ()
+
+            // Rust clears the on-disk record whether or not every process
+            // resumed, so there is nothing left here to re-offer either way.
+            setOrphan None
+        }
+        |> Promise.start
+
     Html.div
         [ prop.className "w-full flex flex-col items-center gap-4"
           prop.children
-              [ (match errorMessage with
+              [ (match orphan with
+                 | Some summary -> OrphanBanner t summary resumeOrphan (fun () -> setOrphan None)
+                 | None -> Html.none)
+                (match errorMessage with
                  | Some message -> ErrorBanner t message (fun () -> setErrorMessage None)
                  | None -> Html.none)
                 (match sessionState with

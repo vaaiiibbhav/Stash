@@ -1,0 +1,23 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <IsPackable>false</IsPackable>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- Types.fs has no Fable/Feliz/browser dependency, so it compiles as-is
+         in a plain .NET test project. Linked (not copied) so the tests always
+         run against the real source, not a stale duplicate. -->
+    <Compile Include="../../src/Types.fs" Link="Types.fs" />
+    <Compile Include="CountdownTests.fs" />
+    <Compile Include="AutoRestoreDelayTests.fs" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.NET.Test.Sdk" Version="17.*" />
+    <PackageReference Include="xunit" Version="2.*" />
+    <PackageReference Include="xunit.runner.visualstudio" Version="2.*" />
+  </ItemGroup>
+
+</Project>
