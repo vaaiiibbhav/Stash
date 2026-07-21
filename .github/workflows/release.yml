@@ -1,0 +1,76 @@
+name: Release
+
+# Builds installers and publishes a GitHub Release when a version tag is
+# pushed (e.g. `git tag v0.2.0 && git push origin v0.2.0`).
+# `workflow_dispatch` allows a manual dry run that builds without publishing.
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+# The release job needs to create the release and upload assets to it.
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Stash suspends processes through Win32/ntdll, so Windows is the
+          # only platform that can actually run it. The macOS and Linux
+          # entries are intentionally omitted rather than left failing.
+          - platform: windows-latest
+            target: x86_64-pc-windows-msvc
+
+    runs-on: ${{ matrix.platform }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install .NET SDK
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "8.0.x"
+
+      - name: Install Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      # Rust deps dominate the build time here; cache them keyed on the lockfile.
+      - name: Cache cargo
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - name: Install npm dependencies
+        run: npm ci
+
+      - name: Run tests
+        run: |
+          dotnet test tests/Stash.Tests/Stash.Tests.fsproj --configuration Release
+          cargo test --manifest-path src-tauri/Cargo.toml
+
+      # tauri-action runs `npm run build` (Vite + Fable) via beforeBuildCommand,
+      # compiles the Rust binary, bundles the installers, and uploads them.
+      - name: Build and publish
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tagName: ${{ github.ref_name }}
+          releaseName: "Stash ${{ github.ref_name }}"
+          releaseBody: "See the assets below to download and install this version."
+          # Publish as a draft so the release can be reviewed before going public.
+          releaseDraft: true
+          prerelease: false
+          args: --target ${{ matrix.target }}

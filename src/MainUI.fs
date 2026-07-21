@@ -300,13 +300,17 @@ let private StashPanel (t: Tokens) =
 
     // Runs once per app launch: ask Rust whether a previous run left a stash
     // record behind without a matching restore (crash, force-kill, logoff).
-    // Best-effort — a failed check just means no recovery banner, which is
-    // safe to skip rather than surface as an error on startup.
+    // A failed check is surfaced rather than swallowed: silence here is
+    // indistinguishable from "nothing was stashed", and being wrong about
+    // that leaves the user's apps frozen with no visible way back.
     React.useEffectOnce (fun () ->
         promise {
             match! Tauri.checkOrphanedStash () with
             | Ok found -> setOrphan found
-            | Error _ -> ()
+            | Error reason ->
+                setErrorMessage (
+                    Some $"Couldn't check for a leftover stash from a previous session: {reason}"
+                )
         }
         |> Promise.start)
 

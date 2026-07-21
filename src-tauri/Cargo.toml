@@ -1,33 +1,35 @@
 [package]
 name = "stash-app"
+# Single source of truth for the app version: tauri.conf.json deliberately
+# omits `version` so the bundler reads it from here. Bump this one line to
+# version a release (keep package.json's `version` in sync for npm's sake).
 version = "0.1.0"
 description = "Stash — stash your open apps and take a break"
 authors = ["Vaibhav Verma"]
-license = ""
+license = "MIT"
 repository = ""
 edition = "2021"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [build-dependencies]
-tauri-build = { version = "1.2", features = [] }
-embed-resource = "2.1"
+tauri-build = { version = "2", features = [] }
 
 [dependencies]
-tauri = { version = "1.2", features = ["shell-open", "system-tray", "window-close", "window-hide", "window-maximize", "window-minimize", "window-set-always-on-top", "window-show", "window-start-dragging", "window-unmaximize", "window-unminimize"] }
+# Tauri 2 replaces v1's allowlist feature flags with the capabilities/ ACL
+# files, so the only feature left to opt into here is the system tray.
+tauri = { version = "2", features = ["tray-icon"] }
+tauri-plugin-log = "2"
+log = "0.4"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 screenshots = "0.5.3"
 base64 = "0.21.0"
 
-
-
 [dependencies.windows]
 version = "0.46.0"
 features = [
-    "Data_Xml_Dom",
     "Win32_Foundation",
-    "Win32_Security",
     "Win32_System_LibraryLoader",
     "Win32_System_Threading",
     "Win32_UI_WindowsAndMessaging",
@@ -37,3 +39,14 @@ features = [
 # this feature is used for production builds or when `devPath` points to the filesystem
 # DO NOT REMOVE!!
 custom-protocol = ["tauri/custom-protocol"]
+
+[profile.release]
+# Release-build optimizations: one codegen unit and fat LTO trade compile time
+# for a smaller, faster binary, and stripping symbols cuts the installer
+# further. Deliberately NOT setting panic = "abort": it would shave a little
+# more size, but it changes panic semantics underneath wry/tauri, which is not
+# a trade worth making for a few hundred KB.
+codegen-units = 1
+lto = true
+opt-level = "s"
+strip = true

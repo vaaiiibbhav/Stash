@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "Stash's frontend only ever calls this app's own #[tauri::command] functions via invoke(). Those are not ACL-gated, and every window operation (hide, show, always-on-top, tray) is performed from Rust rather than from JS — so no core:window, core:webview or plugin permissions are granted here beyond the baseline.",
+  "windows": ["main"],
+  "permissions": ["core:default"]
+}

@@ -5,19 +5,19 @@ use base64::{engine::general_purpose, Engine as _};
 use screenshots::Screen;
 use serde::{Deserialize, Serialize};
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
-use tauri::{
-    AppHandle, CustomMenuItem, Manager, State, SystemTray, SystemTrayEvent, SystemTrayMenu,
-};
+use tauri::menu::{MenuBuilder, MenuItemBuilder};
+use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
+use tauri::{AppHandle, Manager, State, WindowEvent};
 
 use windows::core::{s, PCSTR, PWSTR};
-use windows::Win32::Foundation::{CloseHandle, BOOL, HANDLE, HWND, LPARAM, NTSTATUS};
+use windows::Win32::Foundation::{CloseHandle, BOOL, FILETIME, HANDLE, HWND, LPARAM, NTSTATUS};
 use windows::Win32::System::LibraryLoader::{GetModuleHandleA, GetProcAddress};
 use windows::Win32::System::Threading::{
-    GetCurrentProcessId, OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32,
-    PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SUSPEND_RESUME,
+    GetCurrentProcessId, GetProcessTimes, OpenProcess, QueryFullProcessImageNameW,
+    PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SUSPEND_RESUME,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     EnumWindows, GetWindowInfo, GetWindowTextW, GetWindowThreadProcessId, ShowWindowAsync, SW_HIDE,
@@ -25,13 +25,15 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 
 /// A window we stashed: the window to re-show and the process to resume.
-/// Both are always known at capture time, so `pid` is not optional. `title`
-/// is carried along purely for crash recovery (see `PersistedHandle`) — nothing
-/// in the live suspend/resume path reads it.
+/// `start_time` is the owning process's creation timestamp, used to tell a
+/// live process apart from an unrelated one that merely inherited its PID
+/// (Windows recycles PIDs aggressively). `title` is carried for crash
+/// recovery display only — nothing in the live suspend/resume path reads it.
 #[derive(Clone)]
 struct Handle {
     hwnd: HWND,
     pid: u32,
+    start_time: u64,
     title: String,
 }
 
@@ -49,39 +51,68 @@ struct Handles(Mutex<Vec<Handle>>);
 struct PersistedHandle {
     pid: u32,
     hwnd: isize,
+    #[serde(default)]
+    start_time: u64,
     title: String,
 }
 
 fn stash_file_path(app: &AppHandle) -> Option<PathBuf> {
-    let dir = app.path_resolver().app_local_data_dir()?;
-    fs::create_dir_all(&dir).ok()?;
+    let dir = match app.path().app_local_data_dir() {
+        Ok(dir) => dir,
+        Err(e) => {
+            log::error!("no app-local-data dir available: {e}");
+            return None;
+        }
+    };
+    if let Err(e) = fs::create_dir_all(&dir) {
+        log::error!("could not create {}: {e}", dir.display());
+        return None;
+    }
     Some(dir.join("stashed-session.json"))
 }
 
-/// Best-effort: a failure to persist must never block or fail the stash
-/// itself (the windows are already suspended and hidden by the time this is
-/// called), so errors are logged and swallowed.
+/// Writes the crash-recovery record atomically: serialize to a sibling
+/// temp file, then rename over the real path. `fs::rename` replaces the
+/// destination on Windows, and a rename is atomic, so a crash (or a logoff
+/// killing us mid-write) can leave behind a stale record or a stray temp
+/// file, but never a half-written — and therefore unparseable — record.
+///
+/// Best-effort throughout: the windows are already suspended and hidden by
+/// the time this runs, so a persistence failure must never fail the stash.
 fn persist_handles(app: &AppHandle, handles: &[Handle]) {
     let Some(path) = stash_file_path(app) else {
-        eprintln!("persist_handles: no app-local-data dir available");
         return;
     };
+
     let persisted: Vec<PersistedHandle> = handles
         .iter()
         .map(|h| PersistedHandle {
             pid: h.pid,
             hwnd: h.hwnd.0,
+            start_time: h.start_time,
             title: h.title.clone(),
         })
         .collect();
-    match serde_json::to_string(&persisted) {
-        Ok(json) => {
-            if let Err(e) = fs::write(&path, json) {
-                eprintln!("persist_handles: failed to write {path:?}: {e}");
-            }
+
+    let json = match serde_json::to_string(&persisted) {
+        Ok(json) => json,
+        Err(e) => {
+            log::error!("could not serialize the stash record: {e}");
+            return;
         }
-        Err(e) => eprintln!("persist_handles: failed to serialize: {e}"),
+    };
+
+    let tmp = path.with_extension("json.tmp");
+    if let Err(e) = fs::write(&tmp, json) {
+        log::error!("could not write {}: {e}", tmp.display());
+        return;
     }
+    if let Err(e) = fs::rename(&tmp, &path) {
+        log::error!("could not replace {}: {e}", path.display());
+        let _ = fs::remove_file(&tmp);
+        return;
+    }
+    log::info!("recorded {} stashed window(s) for crash recovery", handles.len());
 }
 
 fn clear_persisted(app: &AppHandle) {
@@ -90,20 +121,56 @@ fn clear_persisted(app: &AppHandle) {
         // else is worth knowing about.
         if let Err(e) = fs::remove_file(&path) {
             if e.kind() != std::io::ErrorKind::NotFound {
-                eprintln!("clear_persisted: failed to remove {path:?}: {e}");
+                log::warn!("could not remove {}: {e}", path.display());
             }
         }
     }
 }
 
+/// Moves an unparseable record aside instead of deleting it, so the next
+/// launch starts clean while the bad file is still available to inspect.
+fn quarantine_corrupt(path: &Path) {
+    let corrupt = path.with_extension("json.corrupt");
+    match fs::rename(path, &corrupt) {
+        Ok(()) => log::warn!("moved unreadable stash record to {}", corrupt.display()),
+        Err(e) => {
+            log::error!("could not quarantine {}: {e}", path.display());
+            let _ = fs::remove_file(path);
+        }
+    }
+}
+
+/// Reads the crash-recovery record. A missing file is the normal steady
+/// state and is silent; a file that exists but cannot be read or parsed is
+/// logged and quarantined rather than silently treated as "nothing was
+/// stashed", which would strand suspended processes with no way back.
 fn read_persisted(app: &AppHandle) -> Vec<PersistedHandle> {
     let Some(path) = stash_file_path(app) else {
         return Vec::new();
     };
-    fs::read_to_string(&path)
-        .ok()
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_default()
+
+    let raw = match fs::read_to_string(&path) {
+        Ok(raw) => raw,
+        Err(e) => {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                log::error!("could not read {}: {e}", path.display());
+                quarantine_corrupt(&path);
+            }
+            return Vec::new();
+        }
+    };
+
+    match serde_json::from_str::<Vec<PersistedHandle>>(&raw) {
+        Ok(entries) => entries,
+        Err(e) => {
+            log::error!(
+                "stash record at {} is malformed ({e}); it will be quarantined",
+                path.display()
+            );
+            quarantine_corrupt(&path);
+            Vec::new()
+        }
+    }
 }
 
 /// One window discovered during enumeration. Defined once at module scope so
@@ -202,15 +269,41 @@ fn process_exe_name(pid: u32) -> Option<String> {
     }
 }
 
+/// The process's creation time as a raw FILETIME (100ns ticks). Together with
+/// the PID this forms an identity that survives PID recycling: Windows can
+/// hand pid 4242 to a new process, but not with the same creation timestamp.
+fn process_start_time(pid: u32) -> Option<u64> {
+    unsafe {
+        let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid).ok()?;
+
+        let mut creation = FILETIME::default();
+        let mut exit = FILETIME::default();
+        let mut kernel = FILETIME::default();
+        let mut user = FILETIME::default();
+        let ok = GetProcessTimes(handle, &mut creation, &mut exit, &mut kernel, &mut user);
+        let _ = CloseHandle(handle);
+
+        if !ok.as_bool() {
+            return None;
+        }
+        Some(((creation.dwHighDateTime as u64) << 32) | creation.dwLowDateTime as u64)
+    }
+}
+
+/// True if the process behind `pid` is still the exact one we stashed, rather
+/// than an unrelated process that was later assigned the same PID. Records
+/// written before start-time tracking existed carry `start_time == 0`; those
+/// fall back to a plain liveness check.
+fn is_same_process(pid: u32, recorded_start_time: u64) -> bool {
+    match process_start_time(pid) {
+        Some(current) => recorded_start_time == 0 || current == recorded_start_time,
+        None => false,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Tauri commands
 // ---------------------------------------------------------------------------
-
-/// Safe round-trip probe used by the frontend to confirm IPC works.
-#[tauri::command]
-fn ping(message: String) -> Result<String, String> {
-    Ok(format!("pong from Rust: {message}"))
-}
 
 /// Captures the primary screen and returns it as a base64-encoded PNG.
 #[tauri::command]
@@ -295,6 +388,10 @@ fn get_apps(app: AppHandle, handles: State<Handles>) -> Result<(String, usize), 
             }
         }
 
+        // Capture identity *before* suspending, so the crash-recovery record
+        // can later tell this exact process from a PID-recycled impostor.
+        let start_time = process_start_time(pid).unwrap_or(0);
+
         // Suspend first; only hide the window once suspension has actually
         // succeeded, so we never leave a window hidden while its process runs.
         match set_process_suspended(pid, true) {
@@ -303,6 +400,7 @@ fn get_apps(app: AppHandle, handles: State<Handles>) -> Result<(String, usize), 
                 store.push(Handle {
                     hwnd: entry.hwnd,
                     pid,
+                    start_time,
                     title: clean_title(&entry.title),
                 });
                 suspended += 1;
@@ -311,7 +409,7 @@ fn get_apps(app: AppHandle, handles: State<Handles>) -> Result<(String, usize), 
                 }
             }
             // Access-denied on elevated processes is expected: skip and carry on.
-            Err(reason) => eprintln!("skipping window (pid {pid}): {reason}"),
+            Err(reason) => log::debug!("skipping window (pid {pid}): {reason}"),
         }
     }
 
@@ -319,6 +417,7 @@ fn get_apps(app: AppHandle, handles: State<Handles>) -> Result<(String, usize), 
     // next successful restore can still be recovered from on next launch.
     persist_handles(&app, store.as_slice());
 
+    log::info!("stashed {suspended} process(es)");
     Ok((preview.join(", "), suspended))
 }
 
@@ -352,6 +451,12 @@ fn restore_all(app: &AppHandle, handles: &Handles) -> Result<(), String> {
 
     let mut errors: Vec<String> = Vec::new();
     for handle in drained {
+        // A PID we stashed may since have exited and had its number reused;
+        // resuming that stranger would be an unrelated side effect.
+        if !is_same_process(handle.pid, handle.start_time) {
+            log::debug!("pid {} is gone or recycled; skipping", handle.pid);
+            continue;
+        }
         match set_process_suspended(handle.pid, false) {
             // Only re-show once the process is actually running again.
             Ok(()) => {
@@ -363,8 +468,10 @@ fn restore_all(app: &AppHandle, handles: &Handles) -> Result<(), String> {
 
     if errors.is_empty() {
         clear_persisted(app);
+        log::info!("restored every stashed window");
         Ok(())
     } else {
+        log::error!("restore finished with {} error(s)", errors.len());
         Err(errors.join("; "))
     }
 }
@@ -376,8 +483,8 @@ fn restore_all(app: &AppHandle, handles: &Handles) -> Result<(), String> {
 /// tuple, whereas an `Option<T>` at the JSON boundary would require the F#
 /// side to trust that a JS `null` round-trips to `None` through Fable's raw
 /// `invoke` — exactly the kind of untyped-boundary risk this project avoids
-/// elsewhere. `count` only reflects entries whose process is still alive;
-/// entries for processes that already exited are dropped from the record.
+/// elsewhere. `count` only reflects entries whose process is still the one we
+/// stashed; exited and PID-recycled entries are dropped.
 #[tauri::command]
 fn check_orphaned_stash(app: AppHandle) -> Result<(bool, String, usize), String> {
     let persisted = read_persisted(&app);
@@ -387,15 +494,18 @@ fn check_orphaned_stash(app: AppHandle) -> Result<(bool, String, usize), String>
 
     let alive: Vec<&PersistedHandle> = persisted
         .iter()
-        .filter(|h| process_exe_name(h.pid).is_some())
+        .filter(|h| is_same_process(h.pid, h.start_time))
         .collect();
 
     if alive.is_empty() {
         // Every recorded process is already gone (closed manually, or reaped
         // by the OS); the stale record no longer describes anything real.
+        log::info!("found a stash record but none of its processes are still alive");
         clear_persisted(&app);
         return Ok((false, String::new(), 0));
     }
+
+    log::info!("found an orphaned stash with {} live process(es)", alive.len());
 
     let preview = alive
         .iter()
@@ -417,8 +527,9 @@ fn resume_orphaned(app: AppHandle) -> Result<(), String> {
 
     let mut errors: Vec<String> = Vec::new();
     for entry in &persisted {
-        if process_exe_name(entry.pid).is_none() {
-            continue; // already gone; nothing to resume
+        // Skip anything that exited or whose PID now belongs to someone else.
+        if !is_same_process(entry.pid, entry.start_time) {
+            continue;
         }
         match set_process_suspended(entry.pid, false) {
             Ok(()) => {
@@ -431,8 +542,10 @@ fn resume_orphaned(app: AppHandle) -> Result<(), String> {
     clear_persisted(&app);
 
     if errors.is_empty() {
+        log::info!("resumed an orphaned stash");
         Ok(())
     } else {
+        log::error!("resuming the orphaned stash hit {} error(s)", errors.len());
         Err(errors.join("; "))
     }
 }
@@ -482,56 +595,121 @@ extern "system" fn enum_window(window: HWND, lparam: LPARAM) -> BOOL {
     }
 }
 
-fn main() {
-    let quit = CustomMenuItem::new("quit".to_string(), "Quit");
-    let show = CustomMenuItem::new("show".to_string(), "Show");
-    let tray_menu = SystemTrayMenu::new().add_item(show).add_item(quit);
-    let tray = SystemTray::new().with_menu(tray_menu);
+/// Brings the main window back into view. Every caller is a UI affordance
+/// (tray click, tray "Show"), so a missing window is logged rather than
+/// panicking the whole app out from under the user's stashed session.
+fn show_main_window(app: &AppHandle) {
+    let Some(window) = app.get_webview_window("main") else {
+        log::error!("no 'main' window to show");
+        return;
+    };
+    if let Err(e) = window.show() {
+        log::warn!("could not show the main window: {e}");
+    }
+    if let Err(e) = window.set_focus() {
+        log::warn!("could not focus the main window: {e}");
+    }
+}
 
+/// Builds the tray icon, its menu, and their handlers. Done in code rather
+/// than via `app.trayIcon` in tauri.conf.json so there is exactly one tray
+/// icon and it owns its own menu wiring.
+fn build_tray(app: &AppHandle) -> tauri::Result<()> {
+    let show = MenuItemBuilder::with_id("show", "Show").build(app)?;
+    let quit = MenuItemBuilder::with_id("quit", "Quit").build(app)?;
+    let menu = MenuBuilder::new(app).items(&[&show, &quit]).build()?;
+
+    let mut tray = TrayIconBuilder::new()
+        .menu(&menu)
+        .show_menu_on_left_click(false)
+        .on_menu_event(|app, event| match event.id().as_ref() {
+            "show" => show_main_window(app),
+            "quit" => {
+                // Resume everything we stashed before exiting, natively — no
+                // fragile eval into the webview, and this actually exits.
+                if let Some(handles) = app.try_state::<Handles>() {
+                    if let Err(reason) = restore_all(app, handles.inner()) {
+                        log::error!("restore-on-quit failed: {reason}");
+                    }
+                }
+                app.exit(0);
+            }
+            other => log::debug!("unhandled tray menu id: {other}"),
+        })
+        .on_tray_icon_event(|tray, event| {
+            if let TrayIconEvent::Click {
+                button: MouseButton::Left,
+                button_state: MouseButtonState::Up,
+                ..
+            } = event
+            {
+                show_main_window(tray.app_handle());
+            }
+        });
+
+    // Reuse the window icon so the tray never renders blank; if the bundled
+    // icon is somehow unavailable, a menu-only tray is still usable.
+    if let Some(icon) = app.default_window_icon().cloned() {
+        tray = tray.icon(icon);
+    } else {
+        log::warn!("no default window icon available for the tray");
+    }
+
+    tray.build(app)?;
+    Ok(())
+}
+
+fn main() {
     tauri::Builder::default()
+        .plugin(
+            tauri_plugin_log::Builder::new()
+                .target(tauri_plugin_log::Target::new(
+                    tauri_plugin_log::TargetKind::LogDir {
+                        file_name: Some("stash".into()),
+                    },
+                ))
+                .target(tauri_plugin_log::Target::new(
+                    tauri_plugin_log::TargetKind::Stdout,
+                ))
+                .level(log::LevelFilter::Info)
+                .build(),
+        )
         .setup(|app| {
-            let main_window = app.get_window("main").unwrap();
-            main_window.set_always_on_top(true).expect("Oopsie");
+            let handle = app.handle();
+
+            match app.get_webview_window("main") {
+                Some(window) => {
+                    if let Err(e) = window.set_always_on_top(true) {
+                        log::warn!("could not pin the window on top: {e}");
+                    }
+                }
+                None => log::error!("no 'main' window found during setup"),
+            }
+
+            if let Err(e) = build_tray(handle) {
+                // A tray failure is survivable — the window still works — but
+                // it removes the restore-from-tray path, so shout about it.
+                log::error!("could not build the tray icon: {e}");
+            }
+
+            log::info!("Stash {} started", env!("CARGO_PKG_VERSION"));
             Ok(())
         })
-        .on_window_event(|event| {
-            if let tauri::WindowEvent::CloseRequested { api, .. } = event.event() {
-                event.window().hide().unwrap();
+        .on_window_event(|window, event| {
+            if let WindowEvent::CloseRequested { api, .. } = event {
+                // Close means "get out of the way", not "quit" — quitting is
+                // the tray's job, and it restores stashed apps on the way out.
+                if let Err(e) = window.hide() {
+                    log::warn!("could not hide the window on close: {e}");
+                }
                 api.prevent_close();
             }
-        })
-        .system_tray(tray)
-        .on_system_tray_event(|app, event| match event {
-            SystemTrayEvent::LeftClick { .. } => {
-                let window = app.get_window("main").unwrap();
-                window.show().unwrap();
-                window.set_focus().unwrap();
-            }
-            SystemTrayEvent::MenuItemClick { id, .. } => match id.as_str() {
-                "quit" => {
-                    // Resume everything we stashed before exiting, natively —
-                    // no fragile __TAURI_INVOKE__ eval, and this actually exits.
-                    if let Some(handles) = app.try_state::<Handles>() {
-                        if let Err(reason) = restore_all(app, handles.inner()) {
-                            eprintln!("restore-on-quit failed: {reason}");
-                        }
-                    }
-                    app.exit(0);
-                }
-                "show" => {
-                    let window = app.get_window("main").unwrap();
-                    window.show().unwrap();
-                }
-                _ => {}
-            },
-            _ => {}
         })
         .manage(Handles(Default::default()))
         .invoke_handler(tauri::generate_handler![
             get_apps,
             restore,
             screen_shot,
-            ping,
             check_orphaned_stash,
             resume_orphaned
         ])
@@ -581,6 +759,7 @@ mod tests {
         Handle {
             hwnd: HWND(pid as isize),
             pid,
+            start_time: 0,
             title: title.to_string(),
         }
     }
@@ -629,6 +808,7 @@ mod tests {
         let original = PersistedHandle {
             pid: 4242,
             hwnd: -17, // HWND values are signed; a real one could be negative.
+            start_time: 133_500_000_000_000_000,
             title: "Notepad".to_string(),
         };
 
@@ -638,6 +818,41 @@ mod tests {
         assert_eq!(restored.len(), 1);
         assert_eq!(restored[0].pid, original.pid);
         assert_eq!(restored[0].hwnd, original.hwnd);
+        assert_eq!(restored[0].start_time, original.start_time);
         assert_eq!(restored[0].title, original.title);
+    }
+
+    #[test]
+    fn records_written_before_start_time_tracking_still_deserialize() {
+        // #[serde(default)] keeps a record written by an older build readable
+        // after an upgrade; without it, every field-add would look like file
+        // corruption and strand a real stashed session.
+        let legacy = r#"[{"pid":4242,"hwnd":-17,"title":"Notepad"}]"#;
+
+        let restored: Vec<PersistedHandle> =
+            serde_json::from_str(legacy).expect("legacy records must still parse");
+
+        assert_eq!(restored.len(), 1);
+        assert_eq!(restored[0].start_time, 0);
+    }
+
+    #[test]
+    fn a_zero_start_time_falls_back_to_plain_liveness() {
+        // Our own process is certainly alive, so a legacy record (start_time
+        // 0) must be treated as "same process", while a mismatched non-zero
+        // timestamp must not be.
+        let own_pid = unsafe { GetCurrentProcessId() };
+
+        assert!(is_same_process(own_pid, 0));
+        assert!(!is_same_process(own_pid, 1));
+    }
+
+    #[test]
+    fn a_matching_start_time_identifies_the_same_process() {
+        let own_pid = unsafe { GetCurrentProcessId() };
+        let start = process_start_time(own_pid).expect("our own start time is readable");
+
+        assert!(start > 0);
+        assert!(is_same_process(own_pid, start));
     }
 }

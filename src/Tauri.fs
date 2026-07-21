@@ -3,9 +3,9 @@ module Stash.Tauri
 open Fable.Core
 open Stash.Types
 
-// Tauri 1.x exposes `invoke` from "@tauri-apps/api/tauri".
-// (When the backend migrates to Tauri 2.x this import moves to "@tauri-apps/api/core".)
-[<Import("invoke", from = "@tauri-apps/api/tauri")>]
+// Tauri 2 exposes `invoke` from "@tauri-apps/api/core" (it lived at
+// "@tauri-apps/api/tauri" in v1).
+[<Import("invoke", from = "@tauri-apps/api/core")>]
 let private invoke<'T> (command: string) : JS.Promise<'T> = jsNative
 
 /// Every command here returns `Result<T, String>` on the Rust side. Tauri
