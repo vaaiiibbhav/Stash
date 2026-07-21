@@ -3,7 +3,7 @@ name = "stash-app"
 # Single source of truth for the app version: tauri.conf.json deliberately
 # omits `version` so the bundler reads it from here. Bump this one line to
 # version a release (keep package.json's `version` in sync for npm's sake).
-version = "0.1.0"
+version = "1.0.0"
 description = "Stash — stash your open apps and take a break"
 authors = ["Vaibhav Verma"]
 license = "MIT"
