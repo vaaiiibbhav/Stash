@@ -94,4 +94,4 @@ discussion on the GitHub repository.
 
 Happy contributing!
 
-<h3 align="center">Stash began as a fork of <a href="https://github.com/Om-Thorat/Defer">Defer</a> by Om 💖</h3>
+<h3 align="center">Stash began as a fork of <a href="https://github.com/vaaiiibbhav/Stash">Defer</a> by Vaibhav Verma</h3>
